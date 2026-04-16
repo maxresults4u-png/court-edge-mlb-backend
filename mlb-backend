@@ -1,0 +1,1378 @@
+from __future__ import annotations
+
+import io
+import math
+import uuid
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Court Edge MLB Backend", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+SITE_RULES: Dict[str, Dict[str, Any]] = {
+    "draftkings": {
+        "salary_cap": 50000,
+        "slots": ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"],
+        "primary_stack_default": 5,
+        "secondary_stack_default": 3,
+        "max_hitters_per_team": 5,
+        "pitcher_slots": 2,
+    },
+    "fanduel": {
+        "salary_cap": 35000,
+        "slots": ["P", "C1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"],
+        "primary_stack_default": 4,
+        "secondary_stack_default": 3,
+        "max_hitters_per_team": 4,
+        "pitcher_slots": 1,
+    },
+}
+
+ORDER_SCORES = {
+    1: 100.0,
+    2: 96.0,
+    3: 98.0,
+    4: 97.0,
+    5: 90.0,
+    6: 82.0,
+    7: 74.0,
+    8: 68.0,
+    9: 70.0,
+}
+
+DEFAULT_NUMERIC_COLUMNS = [
+    "salary",
+    "projection",
+    "ceiling_projection",
+    "floor_projection",
+    "ownership",
+    "team_implied_runs",
+    "park_factor",
+    "weather_factor",
+    "hitter_woba_split",
+    "pitcher_allowed_woba_split",
+    "hitter_iso_split",
+    "pitcher_allowed_iso_split",
+    "pitcher_xfip",
+    "pitcher_hr9",
+    "pitcher_bb_rate",
+    "pitcher_k_rate",
+    "pitcher_hard_hit_allowed",
+    "bullpen_xfip",
+    "bullpen_hr9",
+    "bullpen_bb_rate",
+    "bullpen_k_rate",
+    "barrel_rate",
+    "fly_ball_rate",
+    "sb_rate",
+    "opposing_pitcher_sb_allowed",
+    "catcher_sb_allowed",
+    "on_base_skill",
+    "pitcher_swstr",
+    "pitcher_csw",
+    "projected_innings",
+    "pitch_count_expectation",
+    "quality_start_rate",
+    "opponent_k_rate",
+    "opponent_woba",
+    "opponent_iso",
+    "team_win_probability",
+    "player_volatility",
+]
+
+
+# -----------------------------------------------------------------------------
+# Data models
+# -----------------------------------------------------------------------------
+
+
+class UploadResponse(BaseModel):
+    slate_id: str
+    site: str
+    salary_cap: int
+    player_count: int
+    team_count: int
+    uploaded_filename: str
+
+
+class SlateSummary(BaseModel):
+    slate_id: str
+    site: str
+    salary_cap: int
+    player_count: int
+    team_count: int
+    lock_time: Optional[str] = None
+
+
+class ScoreRequest(BaseModel):
+    persist: bool = True
+
+
+class BuildRules(BaseModel):
+    contest_mode: Literal["cash", "single_entry", "mme"] = "single_entry"
+    lineup_count: int = Field(default=20, ge=1, le=150)
+    randomness_factor: float = Field(default=0.22, ge=0.0, le=1.0)
+    primary_stack_size: Optional[int] = Field(default=None, ge=2, le=5)
+    secondary_stack_size: Optional[int] = Field(default=None, ge=0, le=5)
+    max_hitters_per_team: Optional[int] = Field(default=None, ge=2, le=6)
+    max_hitters_vs_pitcher: int = Field(default=0, ge=0, le=5)
+    unique_players_min: int = Field(default=3, ge=1, le=6)
+    max_pitcher_exposure: float = Field(default=0.55, ge=0.0, le=1.0)
+    max_hitter_exposure: float = Field(default=0.7, ge=0.0, le=1.0)
+    min_salary_used: Optional[int] = None
+    max_total_ownership: Optional[float] = None
+    preferred_primary_teams: List[str] = Field(default_factory=list)
+    excluded_teams: List[str] = Field(default_factory=list)
+    locked_player_ids: List[str] = Field(default_factory=list)
+    excluded_player_ids: List[str] = Field(default_factory=list)
+    avoid_hitter_teams_against_locked_pitchers: bool = True
+
+
+class PlayerOverride(BaseModel):
+    player_id: str
+    lock: Optional[bool] = None
+    exclude: Optional[bool] = None
+    min_exposure: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    max_exposure: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class OverridesRequest(BaseModel):
+    overrides: List[PlayerOverride]
+
+
+class LineupPlayer(BaseModel):
+    player_id: str
+    name: str
+    team: str
+    salary: int
+    positions: List[str]
+    slot: str
+    projection: float
+    ceiling_projection: float
+    ownership: float
+
+
+class BuiltLineup(BaseModel):
+    lineup_id: str
+    lineup_number: int
+    site: str
+    contest_mode: str
+    salary_used: int
+    salary_remaining: int
+    projected_points: float
+    projected_ceiling: float
+    ownership_total: float
+    leverage_score: float
+    duplication_risk: float
+    primary_stack_team: Optional[str] = None
+    secondary_stack_team: Optional[str] = None
+    players: List[LineupPlayer]
+
+
+class SiteConfigResponse(BaseModel):
+    site: str
+    salary_cap: int
+    slots: List[str]
+    primary_stack_default: int
+    secondary_stack_default: int
+    max_hitters_per_team: int
+    pitcher_slots: int
+
+
+@dataclass
+class SlateStore:
+    slate_id: str
+    site: str
+    salary_cap: int
+    raw_df: pd.DataFrame
+    scored_df: Optional[pd.DataFrame] = None
+    lock_time: Optional[str] = None
+
+
+SLATES: Dict[str, SlateStore] = {}
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+
+def _clean_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default
+    if isinstance(value, str):
+        cleaned = value.replace("%", "").replace("$", "").replace(",", "").strip()
+        if cleaned == "":
+            return default
+        try:
+            return float(cleaned)
+        except ValueError:
+            return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    return int(round(_to_float(value, default=default)))
+
+
+
+def _infer_site(columns: List[str]) -> str:
+    lowered = {c.lower() for c in columns}
+    if {"game info", "nickname", "position"}.issubset(lowered):
+        return "fanduel"
+    if {"name", "roster position", "salary", "teamabbr"}.issubset(lowered):
+        return "draftkings"
+    # Default safely to DraftKings because its roster rules are stricter.
+    return "draftkings"
+
+
+
+def _safe_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series([default] * len(df), index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").fillna(default)
+
+
+
+def _normalize_0_100(series: pd.Series, inverse: bool = False) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").fillna(series.mean() if len(series) else 0.0)
+    std = values.std(ddof=0)
+    if std == 0 or math.isnan(std):
+        z = pd.Series([0.0] * len(values), index=values.index)
+    else:
+        z = (values - values.mean()) / std
+    z = z.clip(-2, 2)
+    score = 50 + (25 * z)
+    if inverse:
+        score = 100 - score
+    return score.clip(0, 100)
+
+
+
+def _coalesce(df: pd.DataFrame, candidates: List[str], default: Any = None) -> pd.Series:
+    for candidate in candidates:
+        if candidate in df.columns:
+            return df[candidate]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+
+def _parse_positions(site: str, value: Any) -> List[str]:
+    text = _clean_str(value).upper()
+    if not text:
+        return []
+    for separator in ["/", ",", "|"]:
+        if separator in text:
+            return [p.strip() for p in text.split(separator) if p.strip()]
+
+    if site == "draftkings" and text == "C/1B":
+        return ["C", "1B"]
+    if site == "fanduel" and text in {"C/1B", "1B/C"}:
+        return ["C", "1B"]
+    return [text]
+
+
+
+def _normalize_columns(site: str, source_df: pd.DataFrame) -> pd.DataFrame:
+    df = source_df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    normalized = pd.DataFrame(index=df.index)
+    normalized["player_id"] = _coalesce(df, ["Id", "ID", "Player ID", "player_id", "PlayerID"], default="")
+    normalized["name"] = _coalesce(df, ["Nickname", "Name", "name"], default="Unknown")
+    normalized["team"] = _coalesce(df, ["Team", "TeamAbbrev", "team", "teamabbr"], default="")
+    normalized["opponent"] = _coalesce(df, ["Opponent", "Opp", "opp"], default="")
+    normalized["salary"] = _coalesce(df, ["Salary", "salary"], default=0)
+    normalized["game_info"] = _coalesce(df, ["Game Info", "GameInfo", "game_info"], default="")
+    normalized["batting_order"] = _coalesce(
+        df,
+        ["BattingOrder", "batting_order", "Order", "Lineup Spot", "Roster Order"],
+        default=0,
+    )
+    normalized["throws"] = _coalesce(df, ["Throws", "PitcherThrows", "throws"], default="")
+    normalized["bats"] = _coalesce(df, ["Bats", "Hand", "bats"], default="")
+    normalized["projection"] = _coalesce(df, ["Projection", "Fpts", "AvgPointsPerGame", "projection"], default=0)
+    normalized["ceiling_projection"] = _coalesce(df, ["Ceiling", "CeilingProjection", "ceiling_projection"], default=0)
+    normalized["floor_projection"] = _coalesce(df, ["Floor", "floor_projection"], default=0)
+    normalized["ownership"] = _coalesce(df, ["Ownership", "ProjOwn", "ownership"], default=0)
+    normalized["team_implied_runs"] = _coalesce(df, ["TeamImpliedRuns", "ITT", "team_implied_runs"], default=0)
+    normalized["park_factor"] = _coalesce(df, ["ParkFactor", "park_factor"], default=1.0)
+    normalized["weather_factor"] = _coalesce(df, ["WeatherFactor", "weather_factor"], default=1.0)
+    normalized["player_volatility"] = _coalesce(df, ["Volatility", "StdDev", "player_volatility"], default=0.0)
+
+    # Optional advanced hitter context
+    normalized["hitter_woba_split"] = _coalesce(df, ["HitterWOBA", "hitter_woba_split"], default=0)
+    normalized["pitcher_allowed_woba_split"] = _coalesce(df, ["PitcherAllowedWOBA", "pitcher_allowed_woba_split"], default=0)
+    normalized["hitter_iso_split"] = _coalesce(df, ["HitterISO", "hitter_iso_split"], default=0)
+    normalized["pitcher_allowed_iso_split"] = _coalesce(df, ["PitcherAllowedISO", "pitcher_allowed_iso_split"], default=0)
+    normalized["barrel_rate"] = _coalesce(df, ["BarrelRate", "barrel_rate"], default=0)
+    normalized["fly_ball_rate"] = _coalesce(df, ["FlyBallRate", "fly_ball_rate"], default=0)
+    normalized["sb_rate"] = _coalesce(df, ["SBRate", "sb_rate"], default=0)
+    normalized["opposing_pitcher_sb_allowed"] = _coalesce(df, ["OppPitcherSBAllowed", "opposing_pitcher_sb_allowed"], default=0)
+    normalized["catcher_sb_allowed"] = _coalesce(df, ["CatcherSBAllowed", "catcher_sb_allowed"], default=0)
+    normalized["on_base_skill"] = _coalesce(df, ["OnBaseSkill", "on_base_skill"], default=0)
+
+    # Optional pitcher context
+    normalized["pitcher_xfip"] = _coalesce(df, ["PitcherXFIP", "pitcher_xfip"], default=0)
+    normalized["pitcher_hr9"] = _coalesce(df, ["PitcherHR9", "pitcher_hr9"], default=0)
+    normalized["pitcher_bb_rate"] = _coalesce(df, ["PitcherBBRate", "pitcher_bb_rate"], default=0)
+    normalized["pitcher_k_rate"] = _coalesce(df, ["PitcherKRate", "pitcher_k_rate"], default=0)
+    normalized["pitcher_hard_hit_allowed"] = _coalesce(df, ["PitcherHardHitAllowed", "pitcher_hard_hit_allowed"], default=0)
+    normalized["bullpen_xfip"] = _coalesce(df, ["BullpenXFIP", "bullpen_xfip"], default=0)
+    normalized["bullpen_hr9"] = _coalesce(df, ["BullpenHR9", "bullpen_hr9"], default=0)
+    normalized["bullpen_bb_rate"] = _coalesce(df, ["BullpenBBRate", "bullpen_bb_rate"], default=0)
+    normalized["bullpen_k_rate"] = _coalesce(df, ["BullpenKRate", "bullpen_k_rate"], default=0)
+    normalized["pitcher_swstr"] = _coalesce(df, ["PitcherSwStr", "pitcher_swstr"], default=0)
+    normalized["pitcher_csw"] = _coalesce(df, ["PitcherCSW", "pitcher_csw"], default=0)
+    normalized["projected_innings"] = _coalesce(df, ["ProjectedInnings", "projected_innings"], default=0)
+    normalized["pitch_count_expectation"] = _coalesce(df, ["PitchCountExpectation", "pitch_count_expectation"], default=0)
+    normalized["quality_start_rate"] = _coalesce(df, ["QualityStartRate", "quality_start_rate"], default=0)
+    normalized["opponent_k_rate"] = _coalesce(df, ["OpponentKRate", "opponent_k_rate"], default=0)
+    normalized["opponent_woba"] = _coalesce(df, ["OpponentWOBA", "opponent_woba"], default=0)
+    normalized["opponent_iso"] = _coalesce(df, ["OpponentISO", "opponent_iso"], default=0)
+    normalized["team_win_probability"] = _coalesce(df, ["WinProbability", "team_win_probability"], default=0)
+
+    if site == "draftkings":
+        normalized["positions_raw"] = _coalesce(df, ["Roster Position", "Position", "position"], default="")
+    else:
+        normalized["positions_raw"] = _coalesce(df, ["Position", "Roster Position", "position"], default="")
+
+    normalized["positions"] = normalized["positions_raw"].apply(lambda v: _parse_positions(site, v))
+    normalized["is_pitcher"] = normalized["positions"].apply(lambda pos: "P" in pos)
+    normalized["lock"] = False
+    normalized["exclude"] = False
+    normalized["min_exposure"] = 0.0
+    normalized["max_exposure"] = 1.0
+
+    for column in DEFAULT_NUMERIC_COLUMNS + ["batting_order"]:
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0)
+
+    normalized["salary"] = normalized["salary"].astype(int)
+    normalized["batting_order"] = normalized["batting_order"].astype(int)
+    normalized["team"] = normalized["team"].fillna("").astype(str).str.upper()
+    normalized["opponent"] = normalized["opponent"].fillna("").astype(str).str.upper()
+
+    normalized["player_id"] = normalized["player_id"].astype(str).replace({"": None})
+    normalized["player_id"] = normalized["player_id"].fillna(normalized.index.map(lambda idx: f"row_{idx}"))
+    normalized["name"] = normalized["name"].fillna("Unknown")
+
+    if (normalized["ceiling_projection"] <= 0).all():
+        normalized["ceiling_projection"] = normalized["projection"] * 1.45
+    if (normalized["floor_projection"] <= 0).all():
+        normalized["floor_projection"] = normalized["projection"] * 0.55
+    if (normalized["player_volatility"] <= 0).all():
+        normalized["player_volatility"] = (normalized["ceiling_projection"] - normalized["projection"]).clip(lower=1.0)
+    if (normalized["ownership"] <= 0).all():
+        normalized["ownership"] = 0.0
+    if (normalized["park_factor"] <= 0).all():
+        normalized["park_factor"] = 1.0
+    if (normalized["weather_factor"] <= 0).all():
+        normalized["weather_factor"] = 1.0
+
+    return normalized
+
+
+
+def _slot_eligible(site: str, slot: str, positions: List[str]) -> bool:
+    positions_set = set(positions)
+    if slot == "UTIL":
+        return "P" not in positions_set
+    if slot == "C1B":
+        return bool({"C", "1B"}.intersection(positions_set))
+    return slot in positions_set
+
+
+
+def _build_available_slots(site: str) -> List[str]:
+    return list(SITE_RULES[site]["slots"])
+
+
+
+def _sorted_hitter_pool(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    hitters = df[~df["is_pitcher"] & ~df["exclude"]].copy()
+    return hitters.sort_values(by=[column, "projection", "salary"], ascending=[False, False, True])
+
+
+
+def _sorted_pitcher_pool(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    pitchers = df[df["is_pitcher"] & ~df["exclude"]].copy()
+    return pitchers.sort_values(by=[column, "projection", "salary"], ascending=[False, False, True])
+
+
+
+def _apply_manual_overrides(df: pd.DataFrame, locked_ids: Set[str], excluded_ids: Set[str]) -> pd.DataFrame:
+    out = df.copy()
+    if locked_ids:
+        out.loc[out["player_id"].isin(locked_ids), "lock"] = True
+    if excluded_ids:
+        out.loc[out["player_id"].isin(excluded_ids), "exclude"] = True
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Scoring
+# -----------------------------------------------------------------------------
+
+
+def _score_hitters(df: pd.DataFrame) -> pd.DataFrame:
+    hitters = df[~df["is_pitcher"]].copy()
+    if hitters.empty:
+        return hitters
+
+    hitters["ProjectionScore"] = _normalize_0_100(hitters["projection"])
+    hitters["OrderScore"] = hitters["batting_order"].map(ORDER_SCORES).fillna(60.0)
+    split_edge = hitters["hitter_woba_split"] - hitters["pitcher_allowed_woba_split"]
+    split_power_edge = hitters["hitter_iso_split"] - hitters["pitcher_allowed_iso_split"]
+    hitters["SplitScore"] = (
+        0.65 * _normalize_0_100(split_edge) + 0.35 * _normalize_0_100(split_power_edge)
+    ).clip(0, 100)
+    hitters["TeamRunScore"] = _normalize_0_100(hitters["team_implied_runs"])
+    hitters["ParkScore"] = _normalize_0_100(hitters["park_factor"])
+    hitters["WeatherScore"] = _normalize_0_100(hitters["weather_factor"])
+
+    hitters["PitcherWeaknessScore"] = (
+        0.30 * _normalize_0_100(hitters["pitcher_xfip"])
+        + 0.20 * _normalize_0_100(hitters["pitcher_hr9"])
+        + 0.15 * _normalize_0_100(hitters["pitcher_bb_rate"])
+        + 0.20 * _normalize_0_100(hitters["pitcher_hard_hit_allowed"])
+        + 0.15 * _normalize_0_100(hitters["pitcher_k_rate"], inverse=True)
+    ).clip(0, 100)
+
+    hitters["BullpenWeaknessScore"] = (
+        0.40 * _normalize_0_100(hitters["bullpen_xfip"])
+        + 0.25 * _normalize_0_100(hitters["bullpen_hr9"])
+        + 0.20 * _normalize_0_100(hitters["bullpen_bb_rate"])
+        + 0.15 * _normalize_0_100(hitters["bullpen_k_rate"], inverse=True)
+    ).clip(0, 100)
+
+    hitters["HRUpsideScore"] = (
+        0.45 * _normalize_0_100(hitters["hitter_iso_split"])
+        + 0.20 * _normalize_0_100(hitters["barrel_rate"])
+        + 0.15 * _normalize_0_100(hitters["fly_ball_rate"])
+        + 0.20 * _normalize_0_100(hitters["pitcher_hr9"])
+    ).clip(0, 100)
+
+    hitters["SBScore"] = (
+        0.50 * _normalize_0_100(hitters["sb_rate"])
+        + 0.20 * _normalize_0_100(hitters["opposing_pitcher_sb_allowed"])
+        + 0.15 * _normalize_0_100(hitters["catcher_sb_allowed"])
+        + 0.15 * _normalize_0_100(hitters["on_base_skill"])
+    ).clip(0, 100)
+
+    hitters["HitterMedianScore"] = (
+        0.34 * hitters["ProjectionScore"]
+        + 0.14 * hitters["OrderScore"]
+        + 0.14 * hitters["SplitScore"]
+        + 0.14 * hitters["TeamRunScore"]
+        + 0.08 * hitters["ParkScore"]
+        + 0.10 * hitters["PitcherWeaknessScore"]
+        + 0.06 * hitters["BullpenWeaknessScore"]
+    ).clip(0, 100)
+
+    hitters["HitterCeilingScore"] = (
+        0.22 * hitters["ProjectionScore"]
+        + 0.10 * hitters["OrderScore"]
+        + 0.12 * hitters["SplitScore"]
+        + 0.10 * hitters["TeamRunScore"]
+        + 0.08 * hitters["ParkScore"]
+        + 0.14 * hitters["PitcherWeaknessScore"]
+        + 0.08 * hitters["BullpenWeaknessScore"]
+        + 0.10 * hitters["HRUpsideScore"]
+        + 0.06 * hitters["SBScore"]
+    ).clip(0, 100)
+
+    points_per_dollar = hitters["projection"] / hitters["salary"].replace(0, pd.NA)
+    hitters["ValueScore"] = (
+        0.70 * _normalize_0_100(points_per_dollar.fillna(0))
+        + 0.30 * hitters["HitterMedianScore"]
+    ).clip(0, 100)
+
+    hitters["LeverageScore"] = (
+        0.65 * _normalize_0_100(hitters["ceiling_projection"])
+        - 0.35 * _normalize_0_100(hitters["ownership"])
+    ).clip(0, 100)
+
+    correlation_boost = hitters["batting_order"].map({1: 8, 2: 8, 3: 8, 4: 8, 5: 5, 6: 5, 7: 2, 8: 2, 9: 2}).fillna(2)
+    hitters["HitterStackScore"] = (
+        0.20 * hitters["HitterMedianScore"]
+        + 0.20 * hitters["HitterCeilingScore"]
+        + 0.20 * hitters["TeamRunScore"]
+        + 0.15 * hitters["OrderScore"]
+        + 0.10 * hitters["PitcherWeaknessScore"]
+        + 0.10 * hitters["BullpenWeaknessScore"]
+        + 0.05 * correlation_boost
+    ).clip(0, 100)
+
+    hitters["OneOffScore"] = (
+        0.28 * hitters["HitterMedianScore"]
+        + 0.32 * hitters["HitterCeilingScore"]
+        + 0.20 * hitters["HRUpsideScore"]
+        + 0.10 * hitters["SBScore"]
+        + 0.10 * hitters["LeverageScore"]
+    ).clip(0, 100)
+
+    hitters["BuildScore_cash"] = (0.70 * hitters["HitterMedianScore"] + 0.30 * hitters["ValueScore"]).clip(0, 100)
+    hitters["BuildScore_single_entry"] = (
+        0.30 * hitters["HitterMedianScore"]
+        + 0.35 * hitters["HitterCeilingScore"]
+        + 0.20 * hitters["HitterStackScore"]
+        + 0.15 * hitters["LeverageScore"]
+    ).clip(0, 100)
+    hitters["BuildScore_mme"] = (
+        0.20 * hitters["HitterMedianScore"]
+        + 0.35 * hitters["HitterCeilingScore"]
+        + 0.25 * hitters["HitterStackScore"]
+        + 0.20 * hitters["LeverageScore"]
+    ).clip(0, 100)
+
+    return hitters
+
+
+
+def _score_pitchers(df: pd.DataFrame) -> pd.DataFrame:
+    pitchers = df[df["is_pitcher"]].copy()
+    if pitchers.empty:
+        return pitchers
+
+    pitchers["ProjectionScore"] = _normalize_0_100(pitchers["projection"])
+    pitchers["KUpsideScore"] = (
+        0.45 * _normalize_0_100(pitchers["pitcher_k_rate"])
+        + 0.20 * _normalize_0_100(pitchers["pitcher_swstr"])
+        + 0.15 * _normalize_0_100(pitchers["pitcher_csw"])
+        + 0.20 * _normalize_0_100(pitchers["opponent_k_rate"])
+    ).clip(0, 100)
+
+    pitchers["InningDepthScore"] = (
+        0.45 * _normalize_0_100(pitchers["projected_innings"])
+        + 0.35 * _normalize_0_100(pitchers["pitch_count_expectation"])
+        + 0.20 * _normalize_0_100(pitchers["quality_start_rate"])
+    ).clip(0, 100)
+
+    pitchers["MatchupSafetyScore"] = (
+        0.30 * _normalize_0_100(pitchers["opponent_woba"], inverse=True)
+        + 0.20 * _normalize_0_100(pitchers["opponent_iso"], inverse=True)
+        + 0.15 * _normalize_0_100(pitchers["pitcher_bb_rate"], inverse=True)
+        + 0.15 * _normalize_0_100(pitchers["park_factor"], inverse=True)
+        + 0.20 * _normalize_0_100(pitchers["pitcher_hard_hit_allowed"], inverse=True)
+    ).clip(0, 100)
+
+    pitchers["WinEquityScore"] = _normalize_0_100(pitchers["team_win_probability"])
+
+    pitchers["BlowupRiskScore"] = (
+        0.35 * _normalize_0_100(pitchers["pitcher_hr9"])
+        + 0.25 * _normalize_0_100(pitchers["pitcher_bb_rate"])
+        + 0.20 * _normalize_0_100(pitchers["pitcher_hard_hit_allowed"])
+        + 0.20 * _normalize_0_100(pitchers["opponent_iso"])
+    ).clip(0, 100)
+
+    pitchers["PitcherMedianScore"] = (
+        0.30 * pitchers["ProjectionScore"]
+        + 0.25 * pitchers["KUpsideScore"]
+        + 0.20 * pitchers["InningDepthScore"]
+        + 0.15 * pitchers["MatchupSafetyScore"]
+        + 0.10 * pitchers["WinEquityScore"]
+    ).clip(0, 100)
+
+    pitchers["PitcherCeilingScore"] = (
+        0.20 * pitchers["ProjectionScore"]
+        + 0.38 * pitchers["KUpsideScore"]
+        + 0.18 * pitchers["InningDepthScore"]
+        + 0.10 * pitchers["MatchupSafetyScore"]
+        + 0.14 * pitchers["WinEquityScore"]
+    ).clip(0, 100)
+
+    pitchers["PitcherSafetyScore"] = (
+        0.30 * pitchers["MatchupSafetyScore"]
+        + 0.25 * pitchers["InningDepthScore"]
+        + 0.20 * pitchers["ProjectionScore"]
+        + 0.15 * pitchers["WinEquityScore"]
+        - 0.10 * pitchers["BlowupRiskScore"]
+    ).clip(0, 100)
+
+    projection_per_dollar = pitchers["projection"] / pitchers["salary"].replace(0, pd.NA)
+    pitchers["PitcherValueScore"] = (
+        0.65 * _normalize_0_100(projection_per_dollar.fillna(0))
+        + 0.35 * pitchers["PitcherMedianScore"]
+    ).clip(0, 100)
+
+    pitchers["PitcherLeverageScore"] = (
+        0.55 * _normalize_0_100(pitchers["PitcherCeilingScore"])
+        + 0.10 * _normalize_0_100(pitchers["PitcherSafetyScore"])
+        - 0.35 * _normalize_0_100(pitchers["ownership"])
+    ).clip(0, 100)
+
+    pitchers["BuildScore_cash"] = (0.60 * pitchers["PitcherSafetyScore"] + 0.40 * pitchers["PitcherMedianScore"]).clip(0, 100)
+    pitchers["BuildScore_single_entry"] = (
+        0.30 * pitchers["PitcherMedianScore"]
+        + 0.35 * pitchers["PitcherCeilingScore"]
+        + 0.20 * pitchers["PitcherSafetyScore"]
+        + 0.15 * pitchers["PitcherLeverageScore"]
+    ).clip(0, 100)
+    pitchers["BuildScore_mme"] = (
+        0.15 * pitchers["PitcherMedianScore"]
+        + 0.40 * pitchers["PitcherCeilingScore"]
+        + 0.10 * pitchers["PitcherSafetyScore"]
+        + 0.35 * pitchers["PitcherLeverageScore"]
+    ).clip(0, 100)
+
+    return pitchers
+
+
+
+def score_slate(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    hitters = _score_hitters(df)
+    pitchers = _score_pitchers(df)
+
+    scored = df.copy()
+    score_cols = [col for col in hitters.columns if col.endswith("Score") or col.startswith("BuildScore")]
+    for column in score_cols:
+        scored[column] = 0.0
+    scored.loc[hitters.index, hitters.columns.intersection(scored.columns)] = hitters[hitters.columns.intersection(scored.columns)]
+
+    pitcher_score_cols = [col for col in pitchers.columns if col.endswith("Score") or col.startswith("BuildScore")]
+    for column in pitcher_score_cols:
+        if column not in scored.columns:
+            scored[column] = 0.0
+    scored.loc[pitchers.index, pitchers.columns.intersection(scored.columns)] = pitchers[pitchers.columns.intersection(scored.columns)]
+
+    stacks = build_team_stack_scores(scored)
+    return scored, stacks
+
+
+
+def build_team_stack_scores(scored_df: pd.DataFrame) -> pd.DataFrame:
+    hitters = scored_df[~scored_df["is_pitcher"]].copy()
+    if hitters.empty:
+        return pd.DataFrame(columns=["team", "RawStackScore", "CeilingStackScore", "ValueStackScore", "LeverageStackScore", "ChalkRiskScore"])
+
+    rows: List[Dict[str, Any]] = []
+    for team, group in hitters.groupby("team"):
+        if not team:
+            continue
+        ordered = group.sort_values(by=["batting_order", "HitterStackScore"], ascending=[True, False]).copy()
+        top5 = ordered.head(5)
+        avg_top5_ceiling = float(top5["HitterCeilingScore"].mean()) if not top5.empty else 0.0
+        avg_top5_hr = float(top5["HRUpsideScore"].mean()) if "HRUpsideScore" in top5.columns and not top5.empty else 0.0
+        stack_ppd = ((group["projection"].sum() / max(group["salary"].sum(), 1)) * 1000) if group["salary"].sum() else 0.0
+        cheap_top6 = float((ordered.head(6)["salary"] <= ordered["salary"].median()).mean() * 100) if not ordered.empty else 0.0
+        order_concentration = float((ordered.head(5)["batting_order"] <= 5).mean() * 100) if not ordered.empty else 0.0
+        projected_team_ownership = float(group["ownership"].mean()) if "ownership" in group.columns else 0.0
+
+        rows.append(
+            {
+                "team": team,
+                "team_implied_runs": float(group["team_implied_runs"].max()),
+                "avg_top5_hitter_ceiling": avg_top5_ceiling,
+                "avg_top5_hr_upside": avg_top5_hr,
+                "pitcher_weakness": float(group["PitcherWeaknessScore"].mean()) if "PitcherWeaknessScore" in group.columns else 0.0,
+                "bullpen_weakness": float(group["BullpenWeaknessScore"].mean()) if "BullpenWeaknessScore" in group.columns else 0.0,
+                "park_factor": float(group["park_factor"].mean()),
+                "weather_factor": float(group["weather_factor"].mean()),
+                "order_concentration": order_concentration,
+                "stack_points_per_dollar": stack_ppd,
+                "cheap_top6_hitters_availability": cheap_top6,
+                "projected_team_stack_ownership": projected_team_ownership,
+            }
+        )
+
+    stacks = pd.DataFrame(rows)
+    if stacks.empty:
+        return stacks
+
+    stacks["TeamRunScore"] = _normalize_0_100(stacks["team_implied_runs"])
+    stacks["Top5CeilingScore"] = _normalize_0_100(stacks["avg_top5_hitter_ceiling"])
+    stacks["Top5HRScore"] = _normalize_0_100(stacks["avg_top5_hr_upside"])
+    stacks["PitcherWeaknessScore"] = _normalize_0_100(stacks["pitcher_weakness"])
+    stacks["BullpenWeaknessScore"] = _normalize_0_100(stacks["bullpen_weakness"])
+    stacks["ParkScore"] = _normalize_0_100(stacks["park_factor"])
+    stacks["WeatherScore"] = _normalize_0_100(stacks["weather_factor"])
+    stacks["OrderConcentrationScore"] = _normalize_0_100(stacks["order_concentration"])
+    stacks["StackPPDScore"] = _normalize_0_100(stacks["stack_points_per_dollar"])
+    stacks["CheapTop6Score"] = _normalize_0_100(stacks["cheap_top6_hitters_availability"])
+    stacks["ChalkRiskScore"] = _normalize_0_100(stacks["projected_team_stack_ownership"])
+
+    stacks["RawStackScore"] = (
+        0.28 * stacks["TeamRunScore"]
+        + 0.18 * stacks["Top5CeilingScore"]
+        + 0.15 * stacks["PitcherWeaknessScore"]
+        + 0.12 * stacks["BullpenWeaknessScore"]
+        + 0.10 * stacks["ParkScore"]
+        + 0.07 * stacks["WeatherScore"]
+        + 0.10 * stacks["OrderConcentrationScore"]
+    ).clip(0, 100)
+
+    stacks["CeilingStackScore"] = (
+        0.24 * stacks["TeamRunScore"]
+        + 0.22 * stacks["Top5HRScore"]
+        + 0.18 * stacks["PitcherWeaknessScore"]
+        + 0.12 * stacks["BullpenWeaknessScore"]
+        + 0.12 * stacks["ParkScore"]
+        + 0.12 * stacks["WeatherScore"]
+    ).clip(0, 100)
+
+    stacks["ValueStackScore"] = (
+        0.45 * stacks["StackPPDScore"]
+        + 0.35 * stacks["RawStackScore"]
+        + 0.20 * stacks["CheapTop6Score"]
+    ).clip(0, 100)
+
+    stacks["LeverageStackScore"] = (
+        0.55 * stacks["CeilingStackScore"]
+        + 0.20 * stacks["RawStackScore"]
+        - 0.25 * stacks["ChalkRiskScore"]
+    ).clip(0, 100)
+
+    return stacks.sort_values(by=["LeverageStackScore", "RawStackScore"], ascending=[False, False]).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# Optimizer helpers
+# -----------------------------------------------------------------------------
+
+
+def _resolve_rules(site: str, rules: BuildRules) -> BuildRules:
+    defaults = SITE_RULES[site]
+    return BuildRules(
+        **{
+            **rules.model_dump(),
+            "primary_stack_size": rules.primary_stack_size or defaults["primary_stack_default"],
+            "secondary_stack_size": rules.secondary_stack_size if rules.secondary_stack_size is not None else defaults["secondary_stack_default"],
+            "max_hitters_per_team": rules.max_hitters_per_team or defaults["max_hitters_per_team"],
+            "min_salary_used": rules.min_salary_used or max(defaults["salary_cap"] - 1200, 0),
+        }
+    )
+
+
+
+def _stack_priority_column(contest_mode: str) -> str:
+    if contest_mode == "cash":
+        return "RawStackScore"
+    if contest_mode == "single_entry":
+        return "LeverageStackScore"
+    return "LeverageStackScore"
+
+
+
+def _player_build_score_column(is_pitcher: bool, contest_mode: str) -> str:
+    if is_pitcher:
+        return f"BuildScore_{contest_mode}"
+    return f"BuildScore_{contest_mode}"
+
+
+
+def _choose_pitchers(
+    site: str,
+    df: pd.DataFrame,
+    rules: BuildRules,
+    pitcher_exposure_counter: Counter,
+    lineup_target_count: int,
+    used_player_ids: Set[str],
+) -> List[Dict[str, Any]]:
+    pitcher_pool = _sorted_pitcher_pool(df, _player_build_score_column(True, rules.contest_mode))
+    chosen: List[Dict[str, Any]] = []
+    exposure_limit = max(1, math.floor(rules.max_pitcher_exposure * lineup_target_count))
+
+    for _, pitcher in pitcher_pool.iterrows():
+        pid = str(pitcher["player_id"])
+        if pid in used_player_ids:
+            continue
+        if pid in rules.excluded_player_ids:
+            continue
+        if pitcher_exposure_counter[pid] >= exposure_limit and not bool(pitcher.get("lock", False)):
+            continue
+        chosen.append(pitcher.to_dict())
+        if len(chosen) >= SITE_RULES[site]["pitcher_slots"]:
+            break
+
+    return chosen
+
+
+
+def _choose_stack_team(stacks: pd.DataFrame, rules: BuildRules, excluded: Set[str], preferred: Optional[List[str]] = None) -> Optional[str]:
+    if stacks.empty:
+        return None
+    working = stacks.copy()
+    working = working[~working["team"].isin(list(excluded))]
+    if working.empty:
+        return None
+
+    preferred = preferred or []
+    if preferred:
+        preferred_rows = working[working["team"].isin(preferred)]
+        if not preferred_rows.empty:
+            working = preferred_rows
+
+    column = _stack_priority_column(rules.contest_mode)
+    working = working.sort_values(by=[column, "RawStackScore"], ascending=[False, False])
+    return str(working.iloc[0]["team"])
+
+
+
+def _get_team_hitters(df: pd.DataFrame, team: str, contest_mode: str) -> pd.DataFrame:
+    team_df = df[(~df["is_pitcher"]) & (df["team"] == team) & (~df["exclude"])].copy()
+    return team_df.sort_values(
+        by=["HitterStackScore", f"BuildScore_{contest_mode}", "projection", "salary"],
+        ascending=[False, False, False, True],
+    )
+
+
+
+def _team_from_pitchers(pitchers: List[Dict[str, Any]]) -> Set[str]:
+    return {str(p.get("opponent", "")).upper() for p in pitchers if p.get("opponent")}
+
+
+
+def _position_slot_order(site: str) -> List[str]:
+    slots = _build_available_slots(site)
+    non_flex_first = [slot for slot in slots if slot not in {"UTIL"}]
+    flex_slots = [slot for slot in slots if slot in {"UTIL"}]
+    return non_flex_first + flex_slots
+
+
+
+def _assign_player_to_slot(site: str, player: Dict[str, Any], available_slots: List[str]) -> Optional[str]:
+    for slot in _position_slot_order(site):
+        if slot not in available_slots:
+            continue
+        if _slot_eligible(site, slot, list(player["positions"])):
+            return slot
+    return None
+
+
+
+def _can_add_hitter(
+    team_counter: Counter,
+    player: Dict[str, Any],
+    rules: BuildRules,
+    hitter_teams_vs_pitchers: Set[str],
+) -> bool:
+    team = str(player["team"])
+    if team_counter[team] >= rules.max_hitters_per_team:
+        return False
+    if rules.max_hitters_vs_pitcher == 0 and team in hitter_teams_vs_pitchers:
+        return False
+    return True
+
+
+
+def _candidate_variation_score(row: pd.Series, base_col: str, exposure_counter: Counter, exposure_limit: int, randomness_factor: float) -> float:
+    pid = str(row["player_id"])
+    base = float(row.get(base_col, 0.0))
+    ownership_penalty = float(row.get("ownership", 0.0)) * 0.08
+    exposure_penalty = 0.0
+    if exposure_limit > 0:
+        exposure_penalty = (exposure_counter[pid] / exposure_limit) * 14.0
+    volatility = float(row.get("player_volatility", 0.0))
+    perturbation = min(10.0, volatility * randomness_factor)
+    return base - ownership_penalty - exposure_penalty + perturbation
+
+
+
+def build_lineups(scored_df: pd.DataFrame, stacks_df: pd.DataFrame, rules: BuildRules, site: str) -> List[BuiltLineup]:
+    resolved = _resolve_rules(site, rules)
+    lineup_count = resolved.lineup_count
+    salary_cap = SITE_RULES[site]["salary_cap"]
+
+    hitter_exposure_limit = max(1, math.floor(resolved.max_hitter_exposure * lineup_count))
+    pitcher_exposure_counter: Counter = Counter()
+    hitter_exposure_counter: Counter = Counter()
+    lineups: List[BuiltLineup] = []
+    seen_signatures: Set[Tuple[str, ...]] = set()
+
+    base_df = _apply_manual_overrides(
+        scored_df,
+        set(resolved.locked_player_ids),
+        set(resolved.excluded_player_ids),
+    )
+
+    for lineup_number in range(1, lineup_count + 1):
+        available_slots = _build_available_slots(site)
+        selected: List[Dict[str, Any]] = []
+        used_ids: Set[str] = set()
+        salary_used = 0
+        team_counter: Counter = Counter()
+
+        pitchers = _choose_pitchers(site, base_df, resolved, pitcher_exposure_counter, lineup_count, used_ids)
+        if len(pitchers) < SITE_RULES[site]["pitcher_slots"]:
+            break
+
+        pitcher_opponents = _team_from_pitchers(pitchers)
+        for pitcher in pitchers:
+            slot = _assign_player_to_slot(site, pitcher, available_slots)
+            if slot is None:
+                continue
+            pitcher["assigned_slot"] = slot
+            available_slots.remove(slot)
+            used_ids.add(str(pitcher["player_id"]))
+            selected.append(pitcher)
+            salary_used += int(pitcher["salary"])
+            pitcher_exposure_counter[str(pitcher["player_id"])] += 1
+
+        excluded_teams = set(resolved.excluded_teams)
+        primary_team = _choose_stack_team(stacks_df, resolved, excluded_teams, resolved.preferred_primary_teams)
+        secondary_team: Optional[str] = None
+
+        if primary_team:
+            primary_hitters = _get_team_hitters(base_df, primary_team, resolved.contest_mode)
+            for _, row in primary_hitters.iterrows():
+                player = row.to_dict()
+                pid = str(player["player_id"])
+                if pid in used_ids:
+                    continue
+                if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
+                    continue
+                slot = _assign_player_to_slot(site, player, available_slots)
+                if slot is None:
+                    continue
+                player["assigned_slot"] = slot
+                available_slots.remove(slot)
+                used_ids.add(pid)
+                selected.append(player)
+                salary_used += int(player["salary"])
+                team_counter[str(player["team"])] += 1
+                if team_counter[str(player["team"])] >= resolved.primary_stack_size:
+                    break
+
+        if resolved.secondary_stack_size and resolved.secondary_stack_size > 0:
+            secondary_team = _choose_stack_team(stacks_df, resolved, excluded_teams | {primary_team or ""})
+            if secondary_team:
+                secondary_hitters = _get_team_hitters(base_df, secondary_team, resolved.contest_mode)
+                for _, row in secondary_hitters.iterrows():
+                    player = row.to_dict()
+                    pid = str(player["player_id"])
+                    if pid in used_ids:
+                        continue
+                    if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
+                        continue
+                    slot = _assign_player_to_slot(site, player, available_slots)
+                    if slot is None:
+                        continue
+                    player["assigned_slot"] = slot
+                    available_slots.remove(slot)
+                    used_ids.add(pid)
+                    selected.append(player)
+                    salary_used += int(player["salary"])
+                    team_counter[str(player["team"])] += 1
+                    if team_counter[str(player["team"])] >= resolved.secondary_stack_size:
+                        break
+
+        hitter_pool = _sorted_hitter_pool(base_df, f"BuildScore_{resolved.contest_mode}")
+        for _, row in hitter_pool.iterrows():
+            if not available_slots:
+                break
+            player = row.to_dict()
+            pid = str(player["player_id"])
+            if pid in used_ids:
+                continue
+            if hitter_exposure_counter[pid] >= hitter_exposure_limit and not bool(player.get("lock", False)):
+                continue
+            if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
+                continue
+            slot = _assign_player_to_slot(site, player, available_slots)
+            if slot is None:
+                continue
+            projected_salary = salary_used + int(player["salary"])
+            if projected_salary > salary_cap:
+                continue
+            player["assigned_slot"] = slot
+            available_slots.remove(slot)
+            used_ids.add(pid)
+            selected.append(player)
+            salary_used = projected_salary
+            team_counter[str(player["team"])] += 1
+
+        if available_slots:
+            continue
+        if salary_used > salary_cap:
+            continue
+        if resolved.min_salary_used is not None and salary_used < resolved.min_salary_used:
+            continue
+
+        signature = tuple(sorted(str(p["player_id"])
+                                 for p in selected))
+        if signature in seen_signatures:
+            continue
+
+        if lineups:
+            overlap_fail = False
+            for prior in lineups:
+                prior_ids = {p.player_id for p in prior.players}
+                overlap = len(prior_ids.intersection(signature))
+                max_overlap = len(signature) - resolved.unique_players_min
+                if overlap > max_overlap:
+                    overlap_fail = True
+                    break
+            if overlap_fail:
+                continue
+
+        for player in selected:
+            if "P" not in set(player["positions"]):
+                hitter_exposure_counter[str(player["player_id"])] += 1
+
+        projected_points = round(sum(float(p.get("projection", 0.0)) for p in selected), 2)
+        projected_ceiling = round(sum(float(p.get("ceiling_projection", 0.0)) for p in selected), 2)
+        ownership_total = round(sum(float(p.get("ownership", 0.0)) for p in selected), 2)
+        leverage_total = round(sum(float(p.get("LeverageScore", p.get("PitcherLeverageScore", 0.0))) for p in selected) / max(len(selected), 1), 2)
+
+        stack_bonus = 0.0
+        if primary_team:
+            stack_bonus += 6.0 if team_counter[primary_team] >= resolved.primary_stack_size else 3.0
+        if secondary_team:
+            stack_bonus += 3.0 if team_counter[secondary_team] >= resolved.secondary_stack_size else 1.5
+        projected_ceiling = round(projected_ceiling + stack_bonus, 2)
+
+        duplication_risk = round(
+            (
+                0.35 * min(100.0, ownership_total)
+                + 0.25 * min(100.0, float(stacks_df.set_index("team").loc[primary_team, "ChalkRiskScore"]) if primary_team and primary_team in set(stacks_df["team"]) else 0.0)
+                + 0.20 * min(100.0, max(float(p.get("ownership", 0.0)) for p in pitchers))
+                + 0.20 * (100.0 if salary_cap - salary_used < 100 else 70.0 if salary_cap - salary_used < 400 else 45.0)
+            ) / 1.8,
+            2,
+        )
+
+        lineup_players = [
+            LineupPlayer(
+                player_id=str(p["player_id"]),
+                name=str(p["name"]),
+                team=str(p["team"]),
+                salary=int(p["salary"]),
+                positions=list(p["positions"]),
+                slot=str(p["assigned_slot"]),
+                projection=round(float(p.get("projection", 0.0)), 2),
+                ceiling_projection=round(float(p.get("ceiling_projection", 0.0)), 2),
+                ownership=round(float(p.get("ownership", 0.0)), 2),
+            )
+            for p in selected
+        ]
+
+        seen_signatures.add(signature)
+        lineups.append(
+            BuiltLineup(
+                lineup_id=str(uuid.uuid4()),
+                lineup_number=lineup_number,
+                site=site,
+                contest_mode=resolved.contest_mode,
+                salary_used=salary_used,
+                salary_remaining=salary_cap - salary_used,
+                projected_points=projected_points,
+                projected_ceiling=projected_ceiling,
+                ownership_total=ownership_total,
+                leverage_score=round(leverage_total, 2),
+                duplication_risk=duplication_risk,
+                primary_stack_team=primary_team,
+                secondary_stack_team=secondary_team,
+                players=lineup_players,
+            )
+        )
+
+    return lineups
+
+
+def _lineups_to_dataframe(site: str, lineups: List[BuiltLineup]) -> pd.DataFrame:
+    if not lineups:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    slot_order = SITE_RULES[site]["slots"]
+    for lineup in lineups:
+        row: Dict[str, Any] = {
+            "lineup_id": lineup.lineup_id,
+            "lineup_number": lineup.lineup_number,
+            "site": lineup.site,
+            "contest_mode": lineup.contest_mode,
+            "salary_used": lineup.salary_used,
+            "salary_remaining": lineup.salary_remaining,
+            "projected_points": lineup.projected_points,
+            "projected_ceiling": lineup.projected_ceiling,
+            "ownership_total": lineup.ownership_total,
+            "leverage_score": lineup.leverage_score,
+            "duplication_risk": lineup.duplication_risk,
+            "primary_stack_team": lineup.primary_stack_team or "",
+            "secondary_stack_team": lineup.secondary_stack_team or "",
+        }
+        by_slot = {player.slot: player for player in lineup.players}
+        for slot in slot_order:
+            player = by_slot.get(slot)
+            row[f"{slot}_id"] = player.player_id if player else ""
+            row[f"{slot}_name"] = player.name if player else ""
+            row[f"{slot}_team"] = player.team if player else ""
+            row[f"{slot}_salary"] = player.salary if player else ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
+# API routes
+# -----------------------------------------------------------------------------
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/mlb/upload-csv", response_model=UploadResponse)
+async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
+    filename = file.filename or "upload.csv"
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a CSV file.")
+
+    content = await file.read()
+    try:
+        raw_df = pd.read_csv(io.BytesIO(content))
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {exc}") from exc
+
+    if raw_df.empty:
+        raise HTTPException(status_code=400, detail="CSV file is empty.")
+
+    site = _infer_site(list(raw_df.columns))
+    normalized = _normalize_columns(site, raw_df)
+    slate_id = str(uuid.uuid4())
+    salary_cap = SITE_RULES[site]["salary_cap"]
+
+    SLATES[slate_id] = SlateStore(
+        slate_id=slate_id,
+        site=site,
+        salary_cap=salary_cap,
+        raw_df=normalized,
+        lock_time=None,
+    )
+
+    return UploadResponse(
+        slate_id=slate_id,
+        site=site,
+        salary_cap=salary_cap,
+        player_count=len(normalized),
+        team_count=int(normalized["team"].nunique()),
+        uploaded_filename=filename,
+    )
+
+
+@app.get("/api/mlb/sites/{site}/config", response_model=SiteConfigResponse)
+def get_site_config(site: str) -> SiteConfigResponse:
+    site_key = site.lower()
+    if site_key not in SITE_RULES:
+        raise HTTPException(status_code=404, detail="Unsupported site.")
+    rules = SITE_RULES[site_key]
+    return SiteConfigResponse(
+        site=site_key,
+        salary_cap=rules["salary_cap"],
+        slots=rules["slots"],
+        primary_stack_default=rules["primary_stack_default"],
+        secondary_stack_default=rules["secondary_stack_default"],
+        max_hitters_per_team=rules["max_hitters_per_team"],
+        pitcher_slots=rules["pitcher_slots"],
+    )
+
+
+@app.get("/api/mlb/slates", response_model=List[SlateSummary])
+def list_slates() -> List[SlateSummary]:
+    return [
+        SlateSummary(
+            slate_id=slate.slate_id,
+            site=slate.site,
+            salary_cap=slate.salary_cap,
+            player_count=len(slate.raw_df),
+            team_count=int(slate.raw_df["team"].nunique()),
+            lock_time=slate.lock_time,
+        )
+        for slate in SLATES.values()
+    ]
+
+
+@app.get("/api/mlb/slates/{slate_id}", response_model=SlateSummary)
+def get_slate(slate_id: str) -> SlateSummary:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+    return SlateSummary(
+        slate_id=slate.slate_id,
+        site=slate.site,
+        salary_cap=slate.salary_cap,
+        player_count=len(slate.raw_df),
+        team_count=int(slate.raw_df["team"].nunique()),
+        lock_time=slate.lock_time,
+    )
+
+
+@app.get("/api/mlb/slates/{slate_id}/players")
+def get_players(
+    slate_id: str,
+    scored: bool = Query(default=True),
+    include_excluded: bool = Query(default=True),
+) -> List[Dict[str, Any]]:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+
+    if scored and slate.scored_df is None:
+        slate.scored_df, _ = score_slate(slate.raw_df)
+
+    df = slate.scored_df if scored and slate.scored_df is not None else slate.raw_df
+    out = df.copy()
+    if not include_excluded:
+        out = out[~out["exclude"]]
+    return out.fillna("").to_dict(orient="records")
+
+
+@app.post("/api/mlb/slates/{slate_id}/score")
+def score_route(slate_id: str, payload: ScoreRequest) -> Dict[str, Any]:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+
+    scored, stacks = score_slate(slate.raw_df)
+    if payload.persist:
+        slate.scored_df = scored
+
+    top_pitchers = (
+        scored[scored["is_pitcher"]]
+        .sort_values(by=["BuildScore_single_entry", "projection"], ascending=[False, False])
+        .head(10)[["player_id", "name", "team", "salary", "projection", "PitcherCeilingScore", "PitcherSafetyScore"]]
+        .fillna("")
+        .to_dict(orient="records")
+    )
+    top_hitters = (
+        scored[~scored["is_pitcher"]]
+        .sort_values(by=["BuildScore_single_entry", "projection"], ascending=[False, False])
+        .head(15)[["player_id", "name", "team", "salary", "projection", "HitterCeilingScore", "LeverageScore", "HitterStackScore"]]
+        .fillna("")
+        .to_dict(orient="records")
+    )
+
+    return {
+        "slate_id": slate_id,
+        "player_count": len(scored),
+        "stack_count": len(stacks),
+        "top_pitchers": top_pitchers,
+        "top_hitters": top_hitters,
+        "top_stacks": stacks.head(10).fillna("").to_dict(orient="records"),
+    }
+
+
+@app.get("/api/mlb/slates/{slate_id}/stacks")
+def get_stacks(slate_id: str) -> List[Dict[str, Any]]:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+    if slate.scored_df is None:
+        slate.scored_df, _ = score_slate(slate.raw_df)
+    _, stacks = score_slate(slate.scored_df)
+    return stacks.fillna("").to_dict(orient="records")
+
+
+@app.post("/api/mlb/slates/{slate_id}/overrides")
+def apply_overrides(slate_id: str, payload: OverridesRequest) -> Dict[str, Any]:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+
+    df = slate.scored_df.copy() if slate.scored_df is not None else slate.raw_df.copy()
+    updated_ids: List[str] = []
+
+    for override in payload.overrides:
+        mask = df["player_id"].astype(str) == str(override.player_id)
+        if not mask.any():
+            continue
+        if override.lock is not None:
+            df.loc[mask, "lock"] = override.lock
+        if override.exclude is not None:
+            df.loc[mask, "exclude"] = override.exclude
+        if override.min_exposure is not None:
+            df.loc[mask, "min_exposure"] = override.min_exposure
+        if override.max_exposure is not None:
+            df.loc[mask, "max_exposure"] = override.max_exposure
+        updated_ids.append(str(override.player_id))
+
+    slate.raw_df = df
+    slate.scored_df = None
+    return {"updated_player_ids": updated_ids, "updated_count": len(updated_ids)}
+
+
+@app.post("/api/mlb/slates/{slate_id}/optimize", response_model=List[BuiltLineup])
+def optimize_slate(slate_id: str, rules: BuildRules) -> List[BuiltLineup]:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+
+    if slate.scored_df is None:
+        slate.scored_df, _ = score_slate(slate.raw_df)
+    scored = slate.scored_df.copy()
+    stacks = build_team_stack_scores(scored)
+    lineups = build_lineups(scored, stacks, rules, slate.site)
+
+    if not lineups:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not build any valid lineups with the current rules. Loosen stack size, min salary, or exposure constraints.",
+        )
+
+    return lineups
+
+
+@app.post("/api/mlb/slates/{slate_id}/export")
+def export_lineups_csv(slate_id: str, rules: BuildRules) -> StreamingResponse:
+    slate = SLATES.get(slate_id)
+    if slate is None:
+        raise HTTPException(status_code=404, detail="Slate not found.")
+
+    if slate.scored_df is None:
+        slate.scored_df, _ = score_slate(slate.raw_df)
+    scored = slate.scored_df.copy()
+    stacks = build_team_stack_scores(scored)
+    lineups = build_lineups(scored, stacks, rules, slate.site)
+
+    if not lineups:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not export lineups because no valid lineups were built.",
+        )
+
+    export_df = _lineups_to_dataframe(slate.site, lineups)
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    filename = f"court_edge_mlb_{slate.site}_{slate_id[:8]}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# Local dev entrypoint
+# -----------------------------------------------------------------------------
+
+# Run locally with:
+# uvicorn court_edge_mlb_backend:app --reload
