@@ -4,6 +4,7 @@ import io
 import math
 import uuid
 from collections import Counter, defaultdict
+from itertools import combinations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
@@ -13,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Court Edge MLB Backend", version="0.1.0")
+app = FastAPI(title="Court Edge MLB Backend", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -183,6 +184,8 @@ class BuiltLineup(BaseModel):
     ownership_total: float
     leverage_score: float
     duplication_risk: float
+    lineup_ev: Optional[float] = None
+    stack_shape: Optional[str] = None
     primary_stack_team: Optional[str] = None
     secondary_stack_team: Optional[str] = None
     players: List[LineupPlayer]
@@ -898,16 +901,436 @@ def _candidate_variation_score(row: pd.Series, base_col: str, exposure_counter: 
 
 
 
+
+def _stack_shape_options(site: str, contest_mode: str) -> List[Tuple[int, int]]:
+    if site == "draftkings":
+        if contest_mode == "cash":
+            return [(5, 3), (4, 4), (5, 2)]
+        if contest_mode == "single_entry":
+            return [(5, 3), (4, 4), (5, 2), (4, 3)]
+        return [(5, 3), (5, 2), (4, 4), (4, 3), (3, 3)]
+    if contest_mode == "cash":
+        return [(4, 3), (4, 2), (3, 3)]
+    if contest_mode == "single_entry":
+        return [(4, 3), (4, 2), (3, 3), (4, 1)]
+    return [(4, 3), (4, 2), (3, 3), (4, 1), (3, 2)]
+
+
+def _top_stack_teams(
+    stacks: pd.DataFrame,
+    rules: BuildRules,
+    excluded: Set[str],
+    preferred: Optional[List[str]] = None,
+    limit: int = 6,
+) -> List[str]:
+    if stacks.empty:
+        return []
+    column = _stack_priority_column(rules.contest_mode)
+    working = stacks[~stacks["team"].isin(list(excluded))].copy()
+    if working.empty:
+        return []
+
+    preferred = [str(t).upper() for t in (preferred or []) if str(t).strip()]
+    out: List[str] = []
+    if preferred:
+        pref_rows = working[working["team"].isin(preferred)].sort_values(by=[column, "RawStackScore"], ascending=[False, False])
+        out.extend([str(t) for t in pref_rows["team"].tolist()])
+
+    remaining = working[~working["team"].isin(out)].sort_values(by=[column, "RawStackScore"], ascending=[False, False])
+    out.extend([str(t) for t in remaining["team"].tolist()])
+
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for team in out:
+        if team and team not in seen:
+            deduped.append(team)
+            seen.add(team)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _pitcher_combo_candidates(site: str, df: pd.DataFrame, rules: BuildRules, limit: int = 12) -> List[List[Dict[str, Any]]]:
+    pool = _sorted_pitcher_pool(df, _player_build_score_column(True, rules.contest_mode)).copy()
+    if pool.empty:
+        return []
+    pool["__pitch_score"] = (
+        0.40 * pool[f"BuildScore_{rules.contest_mode}"]
+        + 0.30 * pool.get("PitcherCeilingScore", 0.0)
+        + 0.20 * pool.get("PitcherSafetyScore", 0.0)
+        + 0.10 * pool.get("PitcherLeverageScore", 0.0)
+        - 0.12 * pool.get("ownership", 0.0)
+    )
+    locked = pool[pool["lock"]].copy()
+    unlocked = pool[~pool["lock"]].copy()
+    top_n = 8 if rules.contest_mode == "cash" else 10 if rules.contest_mode == "single_entry" else 14
+    unlocked = unlocked.head(top_n)
+
+    combos: List[Tuple[float, List[Dict[str, Any]]]] = []
+    pitcher_slots = SITE_RULES[site]["pitcher_slots"]
+
+    if pitcher_slots == 1:
+        candidates = pd.concat([locked, unlocked]).drop_duplicates(subset=["player_id"])
+        for _, row in candidates.iterrows():
+            score = float(row["__pitch_score"]) - 0.08 * float(row.get("ownership", 0.0))
+            combos.append((score, [row.to_dict()]))
+    else:
+        if len(locked) >= 2:
+            pair_rows = locked.head(2)
+            score = float(pair_rows["__pitch_score"].sum()) - 0.08 * float(pair_rows["ownership"].sum())
+            combos.append((score, [pair_rows.iloc[0].to_dict(), pair_rows.iloc[1].to_dict()]))
+        else:
+            base_rows = pd.concat([locked, unlocked]).drop_duplicates(subset=["player_id"]).reset_index(drop=True)
+            for idx_a, idx_b in combinations(range(len(base_rows)), 2):
+                a = base_rows.iloc[idx_a]
+                b = base_rows.iloc[idx_b]
+                if a["team"] == b["team"]:
+                    pass
+                combo_score = (
+                    float(a["__pitch_score"]) + float(b["__pitch_score"])
+                    - 0.06 * (float(a.get("ownership", 0.0)) + float(b.get("ownership", 0.0)))
+                    - abs(int(a.get("salary", 0)) - int(b.get("salary", 0))) * 0.0008
+                )
+                combos.append((combo_score, [a.to_dict(), b.to_dict()]))
+
+    combos.sort(key=lambda x: x[0], reverse=True)
+    out: List[List[Dict[str, Any]]] = []
+    seen: Set[Tuple[str, ...]] = set()
+    for _, combo in combos:
+        key = tuple(sorted(str(p["player_id"]) for p in combo))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(combo)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _ordered_team_hitters(df: pd.DataFrame, team: str, contest_mode: str) -> pd.DataFrame:
+    team_df = df[(~df["is_pitcher"]) & (df["team"] == team) & (~df["exclude"])].copy()
+    if team_df.empty:
+        return team_df
+    base_col = f"BuildScore_{contest_mode}"
+    team_df["__team_pick_score"] = (
+        0.36 * team_df.get("HitterStackScore", 0.0)
+        + 0.22 * team_df.get(base_col, 0.0)
+        + 0.12 * team_df.get("LeverageScore", 0.0)
+        + 0.10 * team_df.get("HRUpsideScore", 0.0)
+        + 0.08 * team_df.get("SBScore", 0.0)
+        + 0.07 * team_df.get("OrderScore", 0.0)
+        + 0.05 * team_df.get("ValueScore", 0.0)
+    )
+    return team_df.sort_values(by=["__team_pick_score", "projection", "salary"], ascending=[False, False, True])
+
+
+def _try_add_player(
+    site: str,
+    player: Dict[str, Any],
+    available_slots: List[str],
+    selected: List[Dict[str, Any]],
+    used_ids: Set[str],
+    salary_used: int,
+    salary_cap: int,
+    team_counter: Counter,
+    rules: BuildRules,
+    pitcher_opponents: Set[str],
+) -> Tuple[bool, int]:
+    pid = str(player["player_id"])
+    if pid in used_ids:
+        return False, salary_used
+    if not player.get("is_pitcher", False):
+        if not _can_add_hitter(team_counter, player, rules, pitcher_opponents):
+            return False, salary_used
+    slot = _assign_player_to_slot(site, player, available_slots)
+    if slot is None:
+        return False, salary_used
+    next_salary = salary_used + int(player["salary"])
+    if next_salary > salary_cap:
+        return False, salary_used
+
+    player = dict(player)
+    player["assigned_slot"] = slot
+    available_slots.remove(slot)
+    selected.append(player)
+    used_ids.add(pid)
+    if not player.get("is_pitcher", False):
+        team_counter[str(player["team"])] += 1
+    return True, next_salary
+
+
+def _fill_with_best_hitters(
+    site: str,
+    df: pd.DataFrame,
+    rules: BuildRules,
+    available_slots: List[str],
+    selected: List[Dict[str, Any]],
+    used_ids: Set[str],
+    salary_used: int,
+    salary_cap: int,
+    team_counter: Counter,
+    pitcher_opponents: Set[str],
+    seed: int = 0,
+) -> Tuple[List[Dict[str, Any]], int, List[str]]:
+    notes: List[str] = []
+    hitter_pool = _sorted_hitter_pool(df, f"BuildScore_{rules.contest_mode}").copy()
+    if hitter_pool.empty:
+        return selected, salary_used, notes
+
+    base_col = f"BuildScore_{rules.contest_mode}"
+    scored_rows: List[Tuple[float, Dict[str, Any]]] = []
+    for row_num, (_, row) in enumerate(hitter_pool.iterrows()):
+        row_dict = row.to_dict()
+        score = _candidate_variation_score(row, base_col, Counter(), 0, rules.randomness_factor)
+        score += 0.03 * float(row.get("HitterStackScore", 0.0))
+        score += 0.02 * float(row.get("LeverageScore", 0.0))
+        score += 0.02 * math.sin((seed + row_num + 1) * 1.61803398875)
+        scored_rows.append((score, row_dict))
+    scored_rows.sort(key=lambda x: x[0], reverse=True)
+
+    for _, player in scored_rows:
+        if not available_slots:
+            break
+        added, salary_used = _try_add_player(
+            site, player, available_slots, selected, used_ids, salary_used, salary_cap, team_counter, rules, pitcher_opponents
+        )
+        if added and str(player["team"]):
+            notes.append(f"added_oneoff:{player['name']}")
+    return selected, salary_used, notes
+
+
+def _evaluate_lineup_candidate(
+    selected: List[Dict[str, Any]],
+    stacks_df: pd.DataFrame,
+    rules: BuildRules,
+    salary_cap: int,
+    primary_team: Optional[str],
+    secondary_team: Optional[str],
+    stack_shape: str,
+) -> Dict[str, float]:
+    projected_points = round(sum(float(p.get("projection", 0.0)) for p in selected), 2)
+    projected_ceiling = round(sum(float(p.get("ceiling_projection", 0.0)) for p in selected), 2)
+    ownership_total = round(sum(float(p.get("ownership", 0.0)) for p in selected), 2)
+
+    leverage_values: List[float] = []
+    for p in selected:
+        if p.get("is_pitcher", False):
+            leverage_values.append(float(p.get("PitcherLeverageScore", p.get("LeverageScore", 0.0))))
+        else:
+            leverage_values.append(float(p.get("LeverageScore", 0.0)))
+    leverage_score = round(sum(leverage_values) / max(len(leverage_values), 1), 2)
+
+    stack_table = stacks_df.set_index("team") if not stacks_df.empty else pd.DataFrame()
+    primary_chalk = float(stack_table.loc[primary_team, "ChalkRiskScore"]) if primary_team and primary_team in getattr(stack_table, "index", []) else 0.0
+    secondary_chalk = float(stack_table.loc[secondary_team, "ChalkRiskScore"]) if secondary_team and secondary_team in getattr(stack_table, "index", []) else 0.0
+
+    team_counter = Counter(str(p.get("team", "")) for p in selected if not p.get("is_pitcher", False))
+    main_stack_size = max(team_counter.values()) if team_counter else 0
+    wrap_bonus = 4.0 if stack_shape in {"4-4", "3-3"} else 2.0 if stack_shape in {"4-3", "5-2"} else 1.0
+    stack_bonus = 1.8 * main_stack_size + wrap_bonus
+
+    max_pitcher_own = max((float(p.get("ownership", 0.0)) for p in selected if p.get("is_pitcher", False)), default=0.0)
+    avg_hitter_own = sum(float(p.get("ownership", 0.0)) for p in selected if not p.get("is_pitcher", False)) / max(len([p for p in selected if not p.get("is_pitcher", False)]), 1)
+    salary_remaining = salary_cap - sum(int(p.get("salary", 0)) for p in selected)
+    salary_dup_risk = 82.0 if salary_remaining <= 100 else 68.0 if salary_remaining <= 300 else 54.0 if salary_remaining <= 700 else 38.0
+    stack_shape_risk = {"5-3": 14.0, "5-2": 11.0, "4-4": 10.0, "4-3": 8.0, "3-3": 6.0}.get(stack_shape, 8.0)
+    chalk_concentration = min(100.0, 0.60 * avg_hitter_own + 0.40 * max_pitcher_own)
+
+    duplication_risk = round(
+        max(
+            0.0,
+            min(
+                100.0,
+                0.28 * chalk_concentration
+                + 0.22 * primary_chalk
+                + 0.12 * secondary_chalk
+                + 0.20 * salary_dup_risk
+                + 0.18 * stack_shape_risk,
+            ),
+        ),
+        2,
+    )
+
+    lineup_ev = round(
+        0.24 * projected_points
+        + 0.43 * projected_ceiling
+        + 0.26 * leverage_score
+        + 1.35 * stack_bonus
+        - 0.34 * duplication_risk,
+        2,
+    )
+
+    return {
+        "projected_points": projected_points,
+        "projected_ceiling": round(projected_ceiling + stack_bonus, 2),
+        "ownership_total": ownership_total,
+        "leverage_score": leverage_score,
+        "duplication_risk": duplication_risk,
+        "lineup_ev": lineup_ev,
+    }
+
+
+def _build_candidate_lineup(
+    scored_df: pd.DataFrame,
+    stacks_df: pd.DataFrame,
+    rules: BuildRules,
+    site: str,
+    pitcher_combo: List[Dict[str, Any]],
+    primary_team: Optional[str],
+    secondary_team: Optional[str],
+    primary_size: int,
+    secondary_size: int,
+    seed: int = 0,
+) -> Optional[Dict[str, Any]]:
+    salary_cap = SITE_RULES[site]["salary_cap"]
+    available_slots = _build_available_slots(site)
+    selected: List[Dict[str, Any]] = []
+    used_ids: Set[str] = set()
+    salary_used = 0
+    team_counter: Counter = Counter()
+
+    pitcher_opponents = _team_from_pitchers(pitcher_combo)
+    for pitcher in pitcher_combo:
+        added, salary_used = _try_add_player(
+            site, pitcher, available_slots, selected, used_ids, salary_used, salary_cap, team_counter, rules, pitcher_opponents
+        )
+        if not added:
+            return None
+
+    for team, need in [(primary_team, primary_size), (secondary_team, secondary_size)]:
+        if not team or need <= 0:
+            continue
+        team_df = _ordered_team_hitters(scored_df, team, rules.contest_mode)
+        taken = 0
+        for idx, (_, row) in enumerate(team_df.iterrows()):
+            player = row.to_dict()
+            if str(player["player_id"]) in used_ids:
+                continue
+            added, salary_used = _try_add_player(
+                site, player, available_slots, selected, used_ids, salary_used, salary_cap, team_counter, rules, pitcher_opponents
+            )
+            if added:
+                taken += 1
+            if taken >= need:
+                break
+        if taken < need:
+            return None
+
+    selected, salary_used, notes = _fill_with_best_hitters(
+        site,
+        scored_df,
+        rules,
+        available_slots,
+        selected,
+        used_ids,
+        salary_used,
+        salary_cap,
+        team_counter,
+        pitcher_opponents,
+        seed=seed,
+    )
+    if available_slots:
+        return None
+    if salary_used > salary_cap:
+        return None
+    if rules.min_salary_used is not None and salary_used < rules.min_salary_used:
+        return None
+
+    signature = tuple(sorted(str(p["player_id"]) for p in selected))
+    stack_shape = f"{primary_size}-{secondary_size}" if secondary_size > 0 else f"{primary_size}-0"
+    metrics = _evaluate_lineup_candidate(selected, stacks_df, rules, salary_cap, primary_team, secondary_team, stack_shape)
+
+    return {
+        "signature": signature,
+        "players": selected,
+        "salary_used": salary_used,
+        "primary_stack_team": primary_team,
+        "secondary_stack_team": secondary_team,
+        "stack_shape": stack_shape,
+        "notes": notes,
+        **metrics,
+    }
+
+
+def _portfolio_select_candidates(
+    candidates: List[Dict[str, Any]],
+    lineup_count: int,
+    rules: BuildRules,
+    site: str,
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
+    selected: List[Dict[str, Any]] = []
+    player_exp: Counter = Counter()
+    stack_family_exp: Counter = Counter()
+    pitcher_combo_exp: Counter = Counter()
+
+    max_primary_team_share = math.ceil(lineup_count * (0.45 if rules.contest_mode == "cash" else 0.35 if rules.contest_mode == "single_entry" else 0.25))
+    max_stack_family_share = math.ceil(lineup_count * (0.34 if rules.contest_mode == "cash" else 0.22 if rules.contest_mode == "single_entry" else 0.16))
+    max_pitcher_combo_share = math.ceil(lineup_count * (0.45 if site == "fanduel" else 0.24 if rules.contest_mode != "cash" else 0.34))
+    max_hitter_exposure = max(1, math.floor(rules.max_hitter_exposure * lineup_count))
+    max_pitcher_exposure = max(1, math.floor(rules.max_pitcher_exposure * lineup_count))
+
+    sorted_candidates = sorted(candidates, key=lambda c: (c["lineup_ev"], c["projected_ceiling"], c["leverage_score"]), reverse=True)
+
+    for cand in sorted_candidates:
+        if len(selected) >= lineup_count:
+            break
+        sig = set(cand["signature"])
+        overlap_fail = False
+        for prev in selected:
+            overlap = len(sig.intersection(set(prev["signature"])))
+            max_overlap = len(sig) - rules.unique_players_min
+            if overlap > max_overlap:
+                overlap_fail = True
+                break
+        if overlap_fail:
+            continue
+
+        stack_key = (cand.get("primary_stack_team") or "", cand.get("secondary_stack_team") or "", cand.get("stack_shape") or "")
+        if stack_family_exp[stack_key] >= max_stack_family_share:
+            continue
+        if cand.get("primary_stack_team") and stack_family_exp[(cand.get("primary_stack_team"), "", "")] >= max_primary_team_share:
+            continue
+
+        pitcher_ids = tuple(sorted(str(p["player_id"]) for p in cand["players"] if p.get("is_pitcher", False)))
+        if pitcher_combo_exp[pitcher_ids] >= max_pitcher_combo_share:
+            continue
+
+        exposure_block = False
+        for p in cand["players"]:
+            pid = str(p["player_id"])
+            if p.get("is_pitcher", False):
+                if player_exp[("P", pid)] >= max_pitcher_exposure and not bool(p.get("lock", False)):
+                    exposure_block = True
+                    break
+            else:
+                if player_exp[("H", pid)] >= max_hitter_exposure and not bool(p.get("lock", False)):
+                    exposure_block = True
+                    break
+        if exposure_block:
+            continue
+
+        selected.append(cand)
+        stack_family_exp[stack_key] += 1
+        if cand.get("primary_stack_team"):
+            stack_family_exp[(cand.get("primary_stack_team"), "", "")] += 1
+        pitcher_combo_exp[pitcher_ids] += 1
+        for p in cand["players"]:
+            pid = str(p["player_id"])
+            if p.get("is_pitcher", False):
+                player_exp[("P", pid)] += 1
+            else:
+                player_exp[("H", pid)] += 1
+
+    return selected[:lineup_count]
+
+
 def build_lineups(scored_df: pd.DataFrame, stacks_df: pd.DataFrame, rules: BuildRules, site: str) -> List[BuiltLineup]:
     resolved = _resolve_rules(site, rules)
     lineup_count = resolved.lineup_count
     salary_cap = SITE_RULES[site]["salary_cap"]
-
-    hitter_exposure_limit = max(1, math.floor(resolved.max_hitter_exposure * lineup_count))
-    pitcher_exposure_counter: Counter = Counter()
-    hitter_exposure_counter: Counter = Counter()
-    lineups: List[BuiltLineup] = []
-    seen_signatures: Set[Tuple[str, ...]] = set()
 
     base_df = _apply_manual_overrides(
         scored_df,
@@ -915,152 +1338,72 @@ def build_lineups(scored_df: pd.DataFrame, stacks_df: pd.DataFrame, rules: Build
         set(resolved.excluded_player_ids),
     )
 
-    for lineup_number in range(1, lineup_count + 1):
-        available_slots = _build_available_slots(site)
-        selected: List[Dict[str, Any]] = []
-        used_ids: Set[str] = set()
-        salary_used = 0
-        team_counter: Counter = Counter()
+    pitcher_combos = _pitcher_combo_candidates(site, base_df, resolved, limit=max(8, min(18, lineup_count)))
+    if not pitcher_combos:
+        return []
 
-        pitchers = _choose_pitchers(site, base_df, resolved, pitcher_exposure_counter, lineup_count, used_ids)
-        if len(pitchers) < SITE_RULES[site]["pitcher_slots"]:
+    primary_teams = _top_stack_teams(stacks_df, resolved, set(resolved.excluded_teams), resolved.preferred_primary_teams, limit=7)
+    if not primary_teams:
+        primary_teams = [""]
+
+    shape_options = _stack_shape_options(site, resolved.contest_mode)
+    candidate_limit = max(lineup_count * 18, 120)
+    candidates: List[Dict[str, Any]] = []
+    seen_signatures: Set[Tuple[str, ...]] = set()
+    seed = 0
+
+    for shape in shape_options:
+        primary_size, secondary_size = shape
+        for primary_team in primary_teams:
+            secondary_teams = _top_stack_teams(
+                stacks_df,
+                resolved,
+                set(resolved.excluded_teams) | ({primary_team} if primary_team else set()),
+                None,
+                limit=5,
+            )
+            if secondary_size == 0:
+                secondary_teams = [""]
+            elif not secondary_teams:
+                secondary_teams = [""]
+
+            for secondary_team in secondary_teams:
+                for pitcher_combo in pitcher_combos:
+                    candidate = _build_candidate_lineup(
+                        base_df,
+                        stacks_df,
+                        resolved,
+                        site,
+                        pitcher_combo,
+                        primary_team or None,
+                        secondary_team or None,
+                        primary_size,
+                        secondary_size,
+                        seed=seed,
+                    )
+                    seed += 1
+                    if not candidate:
+                        continue
+                    if candidate["signature"] in seen_signatures:
+                        continue
+                    seen_signatures.add(candidate["signature"])
+                    candidates.append(candidate)
+                    if len(candidates) >= candidate_limit:
+                        break
+                if len(candidates) >= candidate_limit:
+                    break
+            if len(candidates) >= candidate_limit:
+                break
+        if len(candidates) >= candidate_limit:
             break
 
-        pitcher_opponents = _team_from_pitchers(pitchers)
-        for pitcher in pitchers:
-            slot = _assign_player_to_slot(site, pitcher, available_slots)
-            if slot is None:
-                continue
-            pitcher["assigned_slot"] = slot
-            available_slots.remove(slot)
-            used_ids.add(str(pitcher["player_id"]))
-            selected.append(pitcher)
-            salary_used += int(pitcher["salary"])
-            pitcher_exposure_counter[str(pitcher["player_id"])] += 1
+    if not candidates:
+        return []
 
-        excluded_teams = set(resolved.excluded_teams)
-        primary_team = _choose_stack_team(stacks_df, resolved, excluded_teams, resolved.preferred_primary_teams)
-        secondary_team: Optional[str] = None
+    selected_candidates = _portfolio_select_candidates(candidates, lineup_count, resolved, site)
+    lineups: List[BuiltLineup] = []
 
-        if primary_team:
-            primary_hitters = _get_team_hitters(base_df, primary_team, resolved.contest_mode)
-            for _, row in primary_hitters.iterrows():
-                player = row.to_dict()
-                pid = str(player["player_id"])
-                if pid in used_ids:
-                    continue
-                if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
-                    continue
-                slot = _assign_player_to_slot(site, player, available_slots)
-                if slot is None:
-                    continue
-                player["assigned_slot"] = slot
-                available_slots.remove(slot)
-                used_ids.add(pid)
-                selected.append(player)
-                salary_used += int(player["salary"])
-                team_counter[str(player["team"])] += 1
-                if team_counter[str(player["team"])] >= resolved.primary_stack_size:
-                    break
-
-        if resolved.secondary_stack_size and resolved.secondary_stack_size > 0:
-            secondary_team = _choose_stack_team(stacks_df, resolved, excluded_teams | {primary_team or ""})
-            if secondary_team:
-                secondary_hitters = _get_team_hitters(base_df, secondary_team, resolved.contest_mode)
-                for _, row in secondary_hitters.iterrows():
-                    player = row.to_dict()
-                    pid = str(player["player_id"])
-                    if pid in used_ids:
-                        continue
-                    if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
-                        continue
-                    slot = _assign_player_to_slot(site, player, available_slots)
-                    if slot is None:
-                        continue
-                    player["assigned_slot"] = slot
-                    available_slots.remove(slot)
-                    used_ids.add(pid)
-                    selected.append(player)
-                    salary_used += int(player["salary"])
-                    team_counter[str(player["team"])] += 1
-                    if team_counter[str(player["team"])] >= resolved.secondary_stack_size:
-                        break
-
-        hitter_pool = _sorted_hitter_pool(base_df, f"BuildScore_{resolved.contest_mode}")
-        for _, row in hitter_pool.iterrows():
-            if not available_slots:
-                break
-            player = row.to_dict()
-            pid = str(player["player_id"])
-            if pid in used_ids:
-                continue
-            if hitter_exposure_counter[pid] >= hitter_exposure_limit and not bool(player.get("lock", False)):
-                continue
-            if not _can_add_hitter(team_counter, player, resolved, pitcher_opponents):
-                continue
-            slot = _assign_player_to_slot(site, player, available_slots)
-            if slot is None:
-                continue
-            projected_salary = salary_used + int(player["salary"])
-            if projected_salary > salary_cap:
-                continue
-            player["assigned_slot"] = slot
-            available_slots.remove(slot)
-            used_ids.add(pid)
-            selected.append(player)
-            salary_used = projected_salary
-            team_counter[str(player["team"])] += 1
-
-        if available_slots:
-            continue
-        if salary_used > salary_cap:
-            continue
-        if resolved.min_salary_used is not None and salary_used < resolved.min_salary_used:
-            continue
-
-        signature = tuple(sorted(str(p["player_id"])
-                                 for p in selected))
-        if signature in seen_signatures:
-            continue
-
-        if lineups:
-            overlap_fail = False
-            for prior in lineups:
-                prior_ids = {p.player_id for p in prior.players}
-                overlap = len(prior_ids.intersection(signature))
-                max_overlap = len(signature) - resolved.unique_players_min
-                if overlap > max_overlap:
-                    overlap_fail = True
-                    break
-            if overlap_fail:
-                continue
-
-        for player in selected:
-            if "P" not in set(player["positions"]):
-                hitter_exposure_counter[str(player["player_id"])] += 1
-
-        projected_points = round(sum(float(p.get("projection", 0.0)) for p in selected), 2)
-        projected_ceiling = round(sum(float(p.get("ceiling_projection", 0.0)) for p in selected), 2)
-        ownership_total = round(sum(float(p.get("ownership", 0.0)) for p in selected), 2)
-        leverage_total = round(sum(float(p.get("LeverageScore", p.get("PitcherLeverageScore", 0.0))) for p in selected) / max(len(selected), 1), 2)
-
-        stack_bonus = 0.0
-        if primary_team:
-            stack_bonus += 6.0 if team_counter[primary_team] >= resolved.primary_stack_size else 3.0
-        if secondary_team:
-            stack_bonus += 3.0 if team_counter[secondary_team] >= resolved.secondary_stack_size else 1.5
-        projected_ceiling = round(projected_ceiling + stack_bonus, 2)
-
-        duplication_risk = round(
-            (
-                0.35 * min(100.0, ownership_total)
-                + 0.25 * min(100.0, float(stacks_df.set_index("team").loc[primary_team, "ChalkRiskScore"]) if primary_team and primary_team in set(stacks_df["team"]) else 0.0)
-                + 0.20 * min(100.0, max(float(p.get("ownership", 0.0)) for p in pitchers))
-                + 0.20 * (100.0 if salary_cap - salary_used < 100 else 70.0 if salary_cap - salary_used < 400 else 45.0)
-            ) / 1.8,
-            2,
-        )
-
+    for lineup_number, cand in enumerate(selected_candidates, start=1):
         lineup_players = [
             LineupPlayer(
                 player_id=str(p["player_id"]),
@@ -1073,25 +1416,25 @@ def build_lineups(scored_df: pd.DataFrame, stacks_df: pd.DataFrame, rules: Build
                 ceiling_projection=round(float(p.get("ceiling_projection", 0.0)), 2),
                 ownership=round(float(p.get("ownership", 0.0)), 2),
             )
-            for p in selected
+            for p in cand["players"]
         ]
-
-        seen_signatures.add(signature)
         lineups.append(
             BuiltLineup(
                 lineup_id=str(uuid.uuid4()),
                 lineup_number=lineup_number,
                 site=site,
                 contest_mode=resolved.contest_mode,
-                salary_used=salary_used,
-                salary_remaining=salary_cap - salary_used,
-                projected_points=projected_points,
-                projected_ceiling=projected_ceiling,
-                ownership_total=ownership_total,
-                leverage_score=round(leverage_total, 2),
-                duplication_risk=duplication_risk,
-                primary_stack_team=primary_team,
-                secondary_stack_team=secondary_team,
+                salary_used=int(cand["salary_used"]),
+                salary_remaining=salary_cap - int(cand["salary_used"]),
+                projected_points=float(cand["projected_points"]),
+                projected_ceiling=float(cand["projected_ceiling"]),
+                ownership_total=float(cand["ownership_total"]),
+                leverage_score=float(cand["leverage_score"]),
+                duplication_risk=float(cand["duplication_risk"]),
+                lineup_ev=float(cand["lineup_ev"]),
+                stack_shape=str(cand.get("stack_shape") or ""),
+                primary_stack_team=cand.get("primary_stack_team"),
+                secondary_stack_team=cand.get("secondary_stack_team"),
                 players=lineup_players,
             )
         )
@@ -1118,6 +1461,8 @@ def _lineups_to_dataframe(site: str, lineups: List[BuiltLineup]) -> pd.DataFrame
             "ownership_total": lineup.ownership_total,
             "leverage_score": lineup.leverage_score,
             "duplication_risk": lineup.duplication_risk,
+            "lineup_ev": lineup.lineup_ev if lineup.lineup_ev is not None else "",
+            "stack_shape": lineup.stack_shape or "",
             "primary_stack_team": lineup.primary_stack_team or "",
             "secondary_stack_team": lineup.secondary_stack_team or "",
         }
